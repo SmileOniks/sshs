@@ -1,6 +1,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, exit};
+use std::process::{exit, Command};
 use std::{env, fs};
 
 const SSH_CONFIG: &str = r#"Host bastion

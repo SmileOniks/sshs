@@ -11,6 +11,7 @@ use std::{
     cell::RefCell,
     cmp::{max, min},
     io,
+    path::PathBuf,
     rc::Rc,
 };
 use style::palette::tailwind;
@@ -18,10 +19,11 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
+use crate::ssh_config::editor::{self, HostFields, FIELDS};
 use crate::{searchable::Searchable, ssh};
 
 const INFO_TEXT: &str =
-    "(Esc) quit | (↑) move up | (↓) move down | (enter) select | (ctrl+r) reload";
+    "(Esc) quit | (↑) move up | (↓) move down | (enter) select | (ctrl+r) reload | (ctrl+t) add | (ctrl+o) edit";
 
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -51,6 +53,19 @@ pub struct App {
     page_step: usize,
 
     palette: tailwind::Palette,
+
+    form: Option<HostForm>,
+    /// One-shot footer message, cleared on the next key press.
+    status: Option<String>,
+}
+
+/// The add/edit host popup.
+struct HostForm {
+    /// Block being edited: config file, 0-based `Host` line, row name used to detect a stale file. `None` adds a new host.
+    target: Option<(PathBuf, usize, String)>,
+    inputs: [Input; 5],
+    focused: usize,
+    error: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -80,6 +95,8 @@ impl App {
             palette: palette_by_name(&config.color)?,
 
             hosts: Searchable::new(config.sort_by_score, hosts, &search_input),
+            form: None,
+            status: None,
         };
         app.calculate_table_columns_constraints();
 
@@ -119,6 +136,10 @@ impl App {
             let ev = event::read()?;
 
             if let Event::Key(key) = ev {
+                if self.form.is_some() {
+                    self.on_form_key(key);
+                    continue;
+                }
                 if key.kind == KeyEventKind::Press {
                     let action = self.on_key_press(terminal, key)?;
                     match action {
@@ -146,6 +167,8 @@ impl App {
     {
         #[allow(clippy::enum_glob_use)]
         use KeyCode::*;
+
+        self.status = None;
 
         let is_ctrl_pressed = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -229,7 +252,129 @@ impl App {
                 self.reload_hosts();
                 AppKeyAction::Ok
             }
+            Char('t') => {
+                self.open_add_form();
+                AppKeyAction::Ok
+            }
+            Char('o') => {
+                self.open_edit_form();
+                AppKeyAction::Ok
+            }
             _ => AppKeyAction::Continue,
+        }
+    }
+
+    fn open_add_form(&mut self) {
+        self.form = Some(HostForm {
+            target: None,
+            inputs: std::array::from_fn(|_| Input::default()),
+            focused: 0,
+            error: None,
+        });
+    }
+
+    fn open_edit_form(&mut self) {
+        let selected = self.table_state.selected().unwrap_or(0);
+        if selected >= self.hosts.len() {
+            return;
+        }
+        let host = self.hosts[selected].clone();
+
+        let Some((path, line)) = host.source else {
+            self.status = Some(format!(
+                "Can't edit {}: its config file is unknown.",
+                host.name
+            ));
+            return;
+        };
+
+        match editor::read_block(&path, line, &host.name) {
+            Ok(fields) => {
+                self.form = Some(HostForm {
+                    target: Some((path, line, host.name)),
+                    inputs: fields.map(Input::from),
+                    focused: 0,
+                    error: None,
+                });
+            }
+            Err(err) => self.status = Some(format!("Can't edit {}: {err}", path.display())),
+        }
+    }
+
+    fn on_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+
+        if key.kind == KeyEventKind::Press {
+            match key.code {
+                KeyCode::Esc => {
+                    self.form = None;
+                    return;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.form = None;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focused = (form.focused + 1) % FIELDS.len();
+                    return;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focused = (form.focused + FIELDS.len() - 1) % FIELDS.len();
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.save_form();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        form.inputs[form.focused].handle_event(&Event::Key(key));
+    }
+
+    fn save_form(&mut self) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let fields: HostFields = std::array::from_fn(|i| form.inputs[i].value().trim().to_string());
+
+        let invalid = if fields[0].is_empty() {
+            Some("Host must not be empty.")
+        } else if !fields[3].is_empty() && !matches!(fields[3].parse::<u16>(), Ok(1..=u16::MAX)) {
+            Some("Port must be a number from 1 to 65535.")
+        } else {
+            None
+        };
+        if let Some(message) = invalid {
+            form.error = Some(message.to_string());
+            return;
+        }
+
+        let (path, result) = if let Some((path, line, name)) = &form.target {
+            (
+                path.clone(),
+                editor::write_block(path, *line, name, &fields),
+            )
+        } else {
+            let Some(raw) = self.config.config_paths.last() else {
+                form.error = Some("No config file to add the host to.".to_string());
+                return;
+            };
+            let path = PathBuf::from(shellexpand::tilde(raw).as_ref());
+            let result = editor::append_block(&path, &fields);
+            (path, result)
+        };
+
+        match result {
+            Ok(()) => {
+                self.form = None;
+                self.reload_hosts();
+                self.status = Some(format!("Saved to {}", path.display()));
+            }
+            Err(err) => form.error = Some(format!("Can't save to {}: {err}", path.display())),
         }
     }
 
@@ -490,11 +635,16 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     render_footer(f, app, rects[2]);
 
-    let mut cursor_position = rects[0].as_position();
-    cursor_position.x += u16::try_from(app.search.cursor()).unwrap_or_default() + 4;
-    cursor_position.y += 1;
+    if let Some(form) = &app.form {
+        let pos = render_form(f, app, form);
+        f.set_cursor_position(pos);
+    } else {
+        let mut cursor_position = rects[0].as_position();
+        cursor_position.x += u16::try_from(app.search.cursor()).unwrap_or_default() + 4;
+        cursor_position.y += 1;
 
-    f.set_cursor_position(cursor_position);
+        f.set_cursor_position(cursor_position);
+    }
 }
 
 fn render_searchbar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -568,13 +718,77 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let info_footer = Paragraph::new(Line::from(INFO_TEXT)).centered().block(
+    let text = app.status.as_deref().unwrap_or(INFO_TEXT);
+    let info_footer = Paragraph::new(Line::from(text)).centered().block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(app.palette.c400))
             .border_type(BorderType::Rounded),
     );
     f.render_widget(info_footer, area);
+}
+
+fn render_form(f: &mut Frame, app: &App, form: &HostForm) -> Position {
+    // 2 border rows, 5 fields, 1 spacer, 1 error row.
+    let area = f
+        .area()
+        .centered(Constraint::Max(80), Constraint::Length(9));
+
+    let title = match &form.target {
+        Some((path, _, _)) => format!(" Edit host in {} ", path.display()),
+        None => format!(
+            " Add host to {} ",
+            app.config.config_paths.last().map_or("", String::as_str)
+        ),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(app.palette.c400))
+        .title(title)
+        .title_bottom(" (Tab/↑↓) switch field | (Enter) save | (Esc) cancel ");
+
+    let rows = Layout::vertical([Constraint::Length(1); 7]).split(block.inner(area));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let mut cursor = Position::default();
+    for (i, input) in form.inputs.iter().enumerate() {
+        let [label_area, value_area] =
+            Layout::horizontal([Constraint::Length(14), Constraint::Min(1)]).areas(rows[i]);
+
+        let label_style = if i == form.focused {
+            Style::new()
+                .fg(app.palette.c400)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        f.render_widget(Paragraph::new(FIELDS[i].1).style(label_style), label_area);
+
+        let width = value_area.width.max(1) - 1;
+        let scroll = input.visual_scroll(usize::from(width));
+        f.render_widget(
+            Paragraph::new(input.value()).scroll((0, u16::try_from(scroll).unwrap_or_default())),
+            value_area,
+        );
+
+        if i == form.focused {
+            cursor = Position::new(
+                value_area.x
+                    + u16::try_from(input.visual_cursor().saturating_sub(scroll))
+                        .unwrap_or_default(),
+                value_area.y,
+            );
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(form.error.as_deref().unwrap_or(""))
+            .style(Style::new().fg(tailwind::RED.c400)),
+        rows[6],
+    );
+
+    cursor
 }
 
 #[cfg(test)]
@@ -601,6 +815,60 @@ mod tests {
     fn type_char(app: &mut App, c: char) {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_search_event(&ev);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_form_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_form(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn test_add_host_form_writes_config_and_reloads() {
+        let path = std::env::temp_dir().join("sshs_test_add_form.conf");
+        std::fs::write(&path, "Host first\n  HostName first.example.com\n").unwrap();
+
+        let mut config = test_config();
+        config.config_paths = vec![path.to_string_lossy().into_owned()];
+        let mut app = App::new(&config).unwrap();
+
+        app.on_key_press_ctrl(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        type_form(&mut app, "second");
+        press(&mut app, KeyCode::Tab);
+        type_form(&mut app, "second.example.com");
+        press(&mut app, KeyCode::Enter);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(app.form.is_none());
+        assert_eq!(app.hosts.len(), 2);
+        assert_eq!(
+            content,
+            "Host first\n  HostName first.example.com\n\nHost second\n  HostName second.example.com\n"
+        );
+    }
+
+    #[test]
+    fn test_host_form_rejects_invalid_port() {
+        let mut app = App::new(&test_config()).unwrap();
+
+        app.on_key_press_ctrl(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        type_form(&mut app, "x");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        type_form(&mut app, "abc");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.form.as_ref().unwrap().error.as_deref(),
+            Some("Port must be a number from 1 to 65535.")
+        );
     }
 
     #[test]

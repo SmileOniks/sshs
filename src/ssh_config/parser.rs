@@ -48,23 +48,24 @@ impl Parser {
             shellexpand::tilde("~/.ssh").to_string()
         };
 
-        let mut reader = BufReader::new(File::open(path)?);
-        self.parse_with_base(&mut reader, &include_base)
+        let mut reader = BufReader::new(File::open(path.as_ref())?);
+        self.parse_with_base(&mut reader, &include_base, Some(path.as_ref()))
     }
 
     /// # Errors
     ///
     /// Will return `Err` if the SSH configuration cannot be parsed.
     pub fn parse(&self, reader: &mut impl BufRead) -> Result<Vec<Host>, ParseError> {
-        self.parse_with_base(reader, &shellexpand::tilde("~/.ssh"))
+        self.parse_with_base(reader, &shellexpand::tilde("~/.ssh"), None)
     }
 
     fn parse_with_base(
         &self,
         reader: &mut impl BufRead,
         include_base: &str,
+        source_path: Option<&Path>,
     ) -> Result<Vec<Host>, ParseError> {
-        let (global_host, mut hosts) = self.parse_raw(reader, 0, include_base)?;
+        let (global_host, mut hosts) = self.parse_raw(reader, 0, include_base, source_path)?;
 
         if !global_host.is_empty() {
             for host in &mut hosts {
@@ -75,18 +76,23 @@ impl Parser {
         Ok(hosts)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_raw(
         &self,
         reader: &mut impl BufRead,
         depth: usize,
         include_base: &str,
+        source_path: Option<&Path>,
     ) -> Result<(Host, Vec<Host>), ParseError> {
         let mut parent_host = Host::new(Vec::new());
         let mut hosts = Vec::new();
         let mut in_match_block = false;
 
         let mut buf = String::new();
+        let mut next_line = 0usize;
         while reader.read_line(&mut buf)? > 0 {
+            let line_index = next_line;
+            next_line += 1;
             let line = strip_comment(&buf).trim().to_string();
             buf.clear();
 
@@ -110,7 +116,11 @@ impl Parser {
                     in_match_block = false;
 
                     let patterns = parse_patterns(&entry.1);
-                    hosts.push(Host::new(patterns));
+                    let mut host = Host::new(patterns);
+                    if let Some(p) = source_path {
+                        host.set_source(p.to_path_buf(), line_index);
+                    }
+                    hosts.push(host);
 
                     continue;
                 }
@@ -160,9 +170,13 @@ impl Parser {
                             }
                         };
 
-                        let mut file = BufReader::new(File::open(path)?);
-                        let (included_parent_host, included_hosts) =
-                            self.parse_raw(&mut file, depth + 1, include_base)?;
+                        let mut file = BufReader::new(File::open(&path)?);
+                        let (included_parent_host, included_hosts) = self.parse_raw(
+                            &mut file,
+                            depth + 1,
+                            include_base,
+                            Some(path.as_path()),
+                        )?;
 
                         if hosts.is_empty() {
                             parent_host.extend_entries(&included_parent_host);
@@ -198,7 +212,7 @@ impl Parser {
 
 /// Strips a trailing comment, keeping any `#` inside double quotes,
 /// matching OpenSSH's tokenizer.
-fn strip_comment(line: &str) -> &str {
+pub(super) fn strip_comment(line: &str) -> &str {
     let mut in_double_quotes = false;
 
     for (i, c) in line.char_indices() {
@@ -212,7 +226,7 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn parse_line(line: &str) -> Result<Entry, ParseError> {
+pub(super) fn parse_line(line: &str) -> Result<Entry, ParseError> {
     let (mut key, mut value) = line
         .trim()
         .split_once([' ', '\t', '='])
@@ -244,7 +258,7 @@ fn parse_line(line: &str) -> Result<Entry, ParseError> {
     Ok((entry_type, value.to_string()))
 }
 
-fn parse_patterns(entry_value: &str) -> Vec<String> {
+pub(super) fn parse_patterns(entry_value: &str) -> Vec<String> {
     let mut patterns = Vec::new();
 
     let mut pattern = String::new();
@@ -305,6 +319,15 @@ mod tests {
         for host in result {
             assert_eq!(host.get(&EntryType::User).unwrap(), "globaluser");
         }
+    }
+
+    #[test]
+    fn test_parse_file_records_host_source() {
+        let path = testdata("global_settings.conf");
+        let result = Parser::new().parse_file(&path).unwrap();
+
+        assert_eq!(result[0].get_source(), Some(&(path.clone(), 2)));
+        assert_eq!(result[1].get_source(), Some(&(path, 5)));
     }
 
     #[test]

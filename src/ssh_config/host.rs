@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::EntryType;
 
@@ -9,6 +10,7 @@ pub(crate) type Entry = (EntryType, String);
 pub struct Host {
     patterns: Vec<String>,
     entries: HashMap<EntryType, String>,
+    source: Option<(PathBuf, usize)>,
 }
 
 impl Host {
@@ -17,6 +19,7 @@ impl Host {
         Host {
             patterns,
             entries: HashMap::new(),
+            source: None,
         }
     }
 
@@ -50,6 +53,16 @@ impl Host {
     #[allow(clippy::must_use_candidate)]
     pub fn get_patterns(&self) -> &Vec<String> {
         &self.patterns
+    }
+
+    pub(crate) fn set_source(&mut self, path: PathBuf, line: usize) {
+        self.source = Some((path, line));
+    }
+
+    /// The config file and 0-based index of this block's `Host` line.
+    #[allow(clippy::must_use_candidate)]
+    pub fn get_source(&self) -> Option<&(PathBuf, usize)> {
+        self.source.as_ref()
     }
 
     /// # Panics

@@ -3,6 +3,7 @@ use handlebars::Handlebars;
 use itertools::Itertools;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::searchable::SearchableItem;
@@ -16,6 +17,9 @@ pub struct Host {
     pub destination: String,
     pub port: Option<String>,
     pub proxy_command: Option<String>,
+    /// The config file and 0-based line of the `Host` line this row comes from; for rows merged from several blocks, the first block.
+    #[serde(skip)]
+    pub source: Option<(PathBuf, usize)>,
 }
 
 impl SearchableItem for Host {
@@ -128,6 +132,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
                 proxy_command: host.get(&ssh_config::EntryType::ProxyCommand),
                 name,
                 destination,
+                source: host.get_source().cloned(),
             }
         })
         .collect();

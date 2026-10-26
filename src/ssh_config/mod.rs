@@ -1,3 +1,4 @@
+pub mod editor;
 pub mod host;
 mod host_entry;
 pub mod parser;
